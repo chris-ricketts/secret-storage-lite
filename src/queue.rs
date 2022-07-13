@@ -8,15 +8,30 @@ pub struct Queue<'a, T> {
 }
 
 impl<'a, T> Queue<'a, T> {
-    // Creates a Queue with capacity `u32::MAX`
+    const HEAD: &'static [u8] = b"_head";
+    const TAIL: &'static [u8] = b"_tail";
+
+    // Creates a Queue with capacity `u32::MAX - 1'
     pub const fn new(namespace: &'a str) -> Self {
-        Self::with_capacity(namespace, u32::MAX)
+        Self::with_capacity(namespace, u32::MAX - 1)
     }
 
     // Creates a Queue with a number of slots equal to `capacity`
+    // panics if requested capacity is zero or `u32::MAX`
     pub const fn with_capacity(namespace: &'a str, capacity: u32) -> Self {
+        if capacity == 0 {
+            panic!("zero sized queues are illegal");
+        }
+
+        if capacity == u32::MAX {
+            panic!("the maximum legal capacity is u32::MAX - 1");
+        }
+
         let map = Map::new(namespace);
-        Self { capacity, map }
+        Self {
+            capacity: capacity + 1,
+            map,
+        }
     }
 
     pub fn namespace(&self) -> &'a [u8] {
@@ -24,22 +39,13 @@ impl<'a, T> Queue<'a, T> {
     }
 
     pub fn max_capacity(&self) -> u32 {
-        self.capacity
+        self.capacity - 1
     }
-}
-
-impl<'a, T> Queue<'a, T>
-where
-    T: serde::Serialize + serde::de::DeserializeOwned,
-{
-    const FULL: &'static [u8] = b"_full";
-    const HEAD: &'static [u8] = b"_head";
-    const TAIL: &'static [u8] = b"_tail";
 
     pub fn len(&self, store: &dyn Storage) -> u32 {
         let tail = self.tail(store);
         let head = self.head(store);
-        tail.distance_from(head)
+        self.determine_len(head, tail)
     }
 
     pub fn free_capacity(&self, store: &dyn Storage) -> u32 {
@@ -47,27 +53,63 @@ where
     }
 
     pub fn is_full(&self, store: &dyn Storage) -> bool {
-        self.with_namespace_suffix(Self::FULL, |ns| load_bool(store, ns))
+        let tail = self.tail(store);
+        let head = self.head(store);
+        self.determine_is_full(head, tail)
     }
 
+    fn determine_is_full(&self, head: u32, tail: u32) -> bool {
+        self.determine_len(head, tail) == self.max_capacity()
+    }
+
+    fn determine_len(&self, head: u32, tail: u32) -> u32 {
+        if tail >= head {
+            tail.abs_diff(head)
+        } else {
+            self.capacity - head + tail
+        }
+    }
+
+    fn head(&self, store: &dyn Storage) -> u32 {
+        self.with_namespace_suffix(Self::HEAD, |ns| load_u32(store, ns))
+    }
+
+    fn inc_head(&self, store: &mut dyn Storage, head: u32) {
+        let head = (head + 1) % self.capacity;
+        self.with_namespace_suffix(Self::HEAD, |ns| save_u32(store, ns, head))
+    }
+
+    fn tail(&self, store: &dyn Storage) -> u32 {
+        self.with_namespace_suffix(Self::TAIL, |ns| load_u32(store, ns))
+    }
+
+    fn inc_tail(&self, store: &mut dyn Storage, tail: u32) {
+        let tail = (tail + 1) % self.capacity;
+        self.with_namespace_suffix(Self::TAIL, |ns| save_u32(store, ns, tail))
+    }
+
+    fn with_namespace_suffix<R, F: FnOnce(&[u8]) -> R>(&self, namespace: &[u8], f: F) -> R {
+        let namespace = &[self.namespace(), namespace].concat();
+        f(namespace)
+    }
+}
+
+impl<'a, T> Queue<'a, T>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
     /// Add an item to the back of the queue, returns true if the item is added or false if the queue is full
     pub fn push_back(&self, store: &mut dyn Storage, t: &T) -> StdResult<bool> {
         let tail = self.tail(store);
         let head = self.head(store);
 
-        if self.is_full(store) {
+        if self.determine_is_full(head, tail) {
             return Ok(false);
         }
 
         self.map.save(store, tail.into(), t)?;
 
-        let tail = tail + 1;
-
-        if tail.distance_from(head) == self.max_capacity() {
-            self.set_is_full(store, true);
-        }
-
-        self.set_tail(store, tail);
+        self.inc_tail(store, tail);
 
         Ok(true)
     }
@@ -77,128 +119,15 @@ where
         let tail = self.tail(store);
         let head = self.head(store);
 
-        if tail == head && !self.is_full(store) {
+        if tail == head {
             return Ok(None);
         }
 
         let popped = self.map.may_load(store, head.into())?;
 
-        if tail.distance_from(head) == self.max_capacity() {
-            self.set_is_full(store, false);
-        }
-
-        let head = head + 1;
-
-        self.set_head(store, head);
+        self.inc_head(store, head);
 
         Ok(popped)
-    }
-
-    fn set_is_full(&self, store: &mut dyn Storage, is_full: bool) {
-        self.with_namespace_suffix(Self::FULL, |ns| save_bool(store, ns, is_full))
-    }
-
-    fn head(&self, store: &dyn Storage) -> Pointer {
-        self.with_namespace_suffix(Self::HEAD, |ns| {
-            let i = load_u32(store, ns);
-            let max = self.max_capacity();
-            Pointer { i, max }
-        })
-    }
-
-    fn set_head(&self, store: &mut dyn Storage, head: Pointer) {
-        self.with_namespace_suffix(Self::HEAD, |ns| save_u32(store, ns, head.into()))
-    }
-
-    fn tail(&self, store: &dyn Storage) -> Pointer {
-        self.with_namespace_suffix(Self::TAIL, |ns| {
-            let i = load_u32(store, ns);
-            let max = self.max_capacity();
-            Pointer { i, max }
-        })
-    }
-
-    fn set_tail(&self, store: &mut dyn Storage, tail: Pointer) {
-        self.with_namespace_suffix(Self::TAIL, |ns| save_u32(store, ns, tail.into()))
-    }
-
-    fn with_namespace_suffix<R, F: FnOnce(&[u8]) -> R>(&self, namespace: &[u8], f: F) -> R {
-        let namespace = &[self.namespace(), namespace].concat();
-        f(namespace)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Pointer {
-    i: u32,
-    max: u32,
-}
-
-impl Pointer {
-    fn distance_from(self, other: Pointer) -> u32 {
-        if self.i >= other.i {
-            self.i - other.i
-        } else {
-            self.i + other.i
-        }
-    }
-}
-
-impl From<Pointer> for u32 {
-    fn from(p: Pointer) -> Self {
-        p.i
-    }
-}
-
-impl std::ops::Add<u32> for Pointer {
-    type Output = Pointer;
-
-    fn add(self, rhs: u32) -> Self::Output {
-        let (mut i, is_of) = self.i.overflowing_add(rhs);
-
-        if !is_of && i > self.max {
-            i -= self.max;
-        }
-
-        Pointer { i, ..self }
-    }
-}
-
-impl std::ops::Add for Pointer {
-    type Output = Pointer;
-
-    fn add(self, rhs: Self) -> Self::Output {
-        self + rhs.i
-    }
-}
-
-impl std::ops::Sub<u32> for Pointer {
-    type Output = Pointer;
-
-    fn sub(mut self, mut rhs: u32) -> Self::Output {
-        if rhs <= self.i {
-            self.i -= rhs;
-            return self;
-        }
-
-        if rhs > self.max + 1 {
-            rhs = rhs % (self.max + 1);
-        }
-
-        let (i, _) = self.i.overflowing_sub(rhs);
-
-        // take into account user specified max value
-        let i = i - (u32::MAX - self.max);
-
-        Pointer { i, ..self }
-    }
-}
-
-impl std::ops::Sub for Pointer {
-    type Output = Pointer;
-
-    fn sub(self, rhs: Self) -> Self::Output {
-        self - rhs.i
     }
 }
 
@@ -214,102 +143,153 @@ fn save_u32(store: &mut dyn Storage, namespace: &[u8], u: u32) {
     store.set(namespace, &u.to_be_bytes())
 }
 
-fn load_bool(store: &dyn Storage, namespace: &[u8]) -> bool {
-    store
-        .get(namespace)
-        .map(|bytes| bytes[0] == 1)
-        .unwrap_or_default()
-}
-
-fn save_bool(store: &mut dyn Storage, namespace: &[u8], b: bool) {
-    store.set(namespace, if b { &[1] } else { &[0] })
-}
-
 #[cfg(test)]
 mod test {
+    use std::collections::VecDeque;
+
+    use cosmwasm_std::testing::MockStorage;
+    use proptest::prelude::*;
+
     use super::*;
 
-    fn test_is_empty(queue: &Queue<u32>, store: &mut dyn Storage) {
-        let tail = queue.tail(store);
-        let head = queue.head(store);
-        assert_eq!(tail, head);
-        assert_eq!(queue.len(store), 0);
-        assert_eq!(queue.free_capacity(store), queue.max_capacity());
-        assert_eq!(queue.is_full(store), false);
-        assert_eq!(queue.pop_front(store), Ok(None));
+    #[derive(Debug, Clone, Copy, proptest_derive::Arbitrary)]
+    enum Op {
+        Push(u8),
+        Pop,
     }
 
-    fn test_is_full(queue: &Queue<u32>, store: &mut dyn Storage) {
-        assert_eq!(queue.len(store), queue.max_capacity());
-        assert_eq!(queue.free_capacity(store), 0);
-        assert_eq!(queue.is_full(store), true);
-        assert_eq!(queue.push_back(store, &0u32), Ok(false));
+    struct Model {
+        max: usize,
+        q: VecDeque<u8>,
     }
 
-    fn test_push(queue: &Queue<u32>, store: &mut dyn Storage, i: u32) {
-        assert!(queue.push_back(store, &i).unwrap());
-        let tail = queue.tail(store);
-        let head = queue.head(store);
-        let len = i + 1;
-        let capacity = queue.max_capacity() - len;
-        let is_full = queue.max_capacity() == len;
+    impl Model {
+        fn new(max: usize) -> Self {
+            Self {
+                max,
+                q: VecDeque::default(),
+            }
+        }
 
-        assert_eq!(
-            queue.len(store),
-            len,
-            "expected len == {len} after pushing {i}. tail = {tail:?}, head = {head:?}"
-        );
-        assert_eq!(
-            queue.free_capacity(store),
-            capacity,
-            "expected == {capacity} after pushing {i}. tail = {tail:?}, head = {head:?}"
-        );
-        assert_eq!(
-            queue.is_full(store),
-            is_full,
-            "expected is_full == {is_full} after pushing {i}. tail = {tail:?}, head = {head:?}, len = {len}, capacity = {capacity}",
-        );
+        fn push(&mut self, i: u8) -> bool {
+            if self.q.len() == self.max {
+                return false;
+            }
+            self.q.push_back(i);
+            true
+        }
+
+        fn pop(&mut self) -> Option<u8> {
+            self.q.pop_front()
+        }
+
+        fn len(&self) -> usize {
+            self.q.len()
+        }
+
+        fn free_capacity(&self) -> usize {
+            self.max - self.q.len()
+        }
+
+        fn is_full(&self) -> bool {
+            self.q.len() == self.max
+        }
     }
 
-    fn test_pop(queue: &Queue<u32>, store: &mut dyn Storage, i: u32) {
-        assert_eq!(queue.pop_front(store), Ok(Some(i)));
-        let tail = queue.tail(store);
-        let head = queue.head(store);
-        let len = queue.max_capacity() - i - 1;
-        let capacity = i + 1;
-        assert_eq!(
-            queue.len(store),
-            len,
-            "expected len == {len} after pop {i}. tail = {tail:?}, head = {head:?}"
-        );
-        assert_eq!(
-            queue.free_capacity(store),
-            capacity,
-            "expected == {capacity} after pop {i}. tail = {tail:?}, head = {head:?}"
-        );
-        assert_eq!(queue.is_full(store), false);
+    fn setup_queue<T>(size: u32) -> (Queue<'static, T>, MockStorage) {
+        let q = Queue::with_capacity("test", size);
+        let store = cosmwasm_std::testing::MockStorage::new();
+        (q, store)
+    }
+
+    proptest! {
+        #[test]
+        fn impl_matches_model(size in 1u32..1000u32, ops: Vec<Op>) {
+            let mut model = Model::new(size as _);
+            let (queue, mut store) = setup_queue(size);
+            for op in ops {
+                match op {
+                    Op::Push(u) => {
+                        let model_res = model.push(u);
+                        let impl_res = queue.push_back(&mut store, &u).unwrap();
+                        prop_assert_eq!(model_res, impl_res, "push results differ");
+                    }
+                    Op::Pop => {
+                        let model_res = model.pop();
+                        let impl_res = queue.pop_front(&mut store).unwrap();
+                        prop_assert_eq!(model_res, impl_res, "pop results differ");
+                    }
+                }
+
+                prop_assert_eq!(queue.len(&store), model.len() as u32, "len results differ");
+                prop_assert_eq!(queue.free_capacity(&store), model.free_capacity() as u32, "free_capacity results differ");
+                prop_assert_eq!(queue.is_full(&store), model.is_full(), "is_full results differ");
+            }
+        }
     }
 
     #[test]
-    fn smoke_test() {
-        const SIZE: u32 = 5;
+    fn invariant_max_capacity_queue_wraps_around() {
+        let queue = Queue::new("test");
+        let mut store = MockStorage::new();
+        save_u32(&mut store, b"test_tail", u32::MAX - 1);
+        save_u32(&mut store, b"test_head", u32::MAX - 1);
+        assert_eq!(queue.len(&store), 0);
+        assert!(queue.push_back(&mut store, &0u8).unwrap());
+        assert!(queue.push_back(&mut store, &0u8).unwrap());
+        assert_eq!(queue.len(&store), 2);
+        assert_eq!(queue.tail(&store), 1);
+        assert!(queue.pop_front(&mut store).unwrap().is_some());
+        assert!(queue.pop_front(&mut store).unwrap().is_some());
+        assert_eq!(queue.head(&store), 1);
+        assert_eq!(queue.len(&store), 0);
+    }
 
-        let queue = Queue::with_capacity("test", SIZE);
+    #[test]
+    fn invariant_push_non_full_changes_tail() {
+        let (queue, mut store) = setup_queue(1);
+        let pre_tail = queue.tail(&store);
+        assert!(queue.push_back(&mut store, &0u8).unwrap());
+        let post_tail = queue.tail(&store);
+        assert_ne!(pre_tail, post_tail);
+    }
 
-        let mut store = cosmwasm_std::testing::MockStorage::new();
+    #[test]
+    fn invariant_pop_non_empty_changes_head() {
+        let (queue, mut store) = setup_queue(1);
+        assert!(queue.push_back(&mut store, &0u8).unwrap());
+        let pre_head = queue.head(&store);
+        assert!(queue.pop_front(&mut store).unwrap().is_some());
+        let post_head = queue.head(&store);
+        assert_ne!(pre_head, post_head);
+    }
 
-        test_is_empty(&queue, &mut store);
+    #[test]
+    fn invariant_tail_and_head_wrap_around() {
+        let (queue, mut store) = setup_queue(1);
+        assert!(queue.push_back(&mut store, &0u8).unwrap());
+        assert!(queue.pop_front(&mut store).unwrap().is_some());
+        assert!(queue.push_back(&mut store, &0u8).unwrap());
+        assert!(queue.pop_front(&mut store).unwrap().is_some());
+        assert_eq!(queue.tail(&store), 0);
+        assert_eq!(queue.head(&store), 0);
+    }
 
-        for i in 0..SIZE {
-            test_push(&queue, &mut store, i);
-        }
+    #[test]
+    fn invariant_cannot_push_onto_full_queue() {
+        let (queue, mut store) = setup_queue(2);
+        assert!(queue.push_back(&mut store, &0u8).unwrap());
+        assert!(queue.push_back(&mut store, &0u8).unwrap());
+        assert_eq!(queue.push_back(&mut store, &0u8), Ok(false));
+    }
 
-        test_is_full(&queue, &mut store);
-
-        for i in 0..SIZE {
-            test_pop(&queue, &mut store, i);
-        }
-
-        test_is_empty(&queue, &mut store);
+    #[test]
+    fn invariant_cannot_pop_off_empty_queue() {
+        let (queue, mut store) = setup_queue(2);
+        assert!(queue.push_back(&mut store, &0u8).unwrap());
+        assert!(queue.push_back(&mut store, &0u8).unwrap());
+        assert!(queue.pop_front(&mut store).unwrap().is_some());
+        assert!(queue.pop_front(&mut store).unwrap().is_some());
+        assert!(queue.pop_front(&mut store).unwrap().is_none());
     }
 }

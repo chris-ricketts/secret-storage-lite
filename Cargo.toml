@@ -10,3 +10,7 @@ bincode2 = "2.0.1"
 const_format = "0.2.25"
 cosmwasm-std = { version = "0.10", package = "secret-cosmwasm-std" }
 serde = "1.0.137"
+
+[dev-dependencies]
+proptest = "1.0.0"
+proptest-derive = "0.3.0"
